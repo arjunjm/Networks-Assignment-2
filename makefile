@@ -1,4 +1,7 @@
+client.o: server.o
+	g++ -Wall -o  client  client.cpp
 server.o: 
-	gcc -Wall   -o  server  server.cpp
+	g++ -Wall -Wno-sign-compare  -o  server  server.cpp
 clean:
 	rm -rf server
+	rm -rf client

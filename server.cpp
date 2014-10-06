@@ -8,15 +8,14 @@
 
 using namespace std;
 
-Server::Server(char *servIP, char *portNum, int maxConns)
+Server::Server(char *servIP, char *portNum)
 {
     strcpy(this->serverIP, servIP);
     strcpy(this->portNum, portNum);
-    this->maxConnections = maxConns;
 
     memset(&this->hints, 0, sizeof hints);
     this->hints.ai_family = AF_UNSPEC;
-    this->hints.ai_socktype = SOCK_STREAM;
+    this->hints.ai_socktype = SOCK_DGRAM;
     this->hints.ai_flags = 0; 
 }
 
@@ -187,6 +186,8 @@ int Server::acceptConnection()
     struct sockaddr_storage clientAddr;
     socklen_t sin_size;
     char ipAddr[INET6_ADDRSTRLEN]; 
+    char buf[MAXDATASIZE];
+    int numBytes;
     fd_set master, read_fds;
     int fdMax;
     struct timeval tv;
@@ -197,8 +198,96 @@ int Server::acceptConnection()
 
     FD_SET(sockFd, &master);
     fdMax = sockFd;
+
     while(1)
     {
+        sin_size = sizeof clientAddr;
+        if ((numBytes = recvfrom(sockFd, buf, MAXDATASIZE-1, 0, 
+                    (struct sockaddr*)&clientAddr, &sin_size)) == -1)
+        {
+            perror("recvfrom");
+            exit(1);
+        }
+        else
+        {
+            char *fileName = new char();
+            int i = 0;
+            int offset = sizeof(short);
+            while (true)
+            {
+                if (buf[i + offset] == '\0')
+                    break;
+                fileName[i] = buf[i + offset];
+                i++;
+            }
+            fileName[i] = '\0';
+
+            // Get File Size
+            FILE *fp = fopen(fileName, "rb"); 
+            if (fp == NULL)
+            {
+                perror("Error while trying to open file");
+
+                /*
+                 * Sending ERR TFTP Header
+                 */
+                char errMessage[30] = "No such file or directory";
+                char *errPacket = createTFTPHeader(ERR, errMessage, 0, errno);
+                int sentBytes = sendto(sockFd, errPacket, strlen(errMessage) + 4, 0,
+                        (struct sockaddr*)&clientAddr, sizeof(struct sockaddr_storage));
+                continue;
+            }
+
+            char fileData[512];
+            bzero(fileData, 512);
+            int fileSize  = getFileSize(fileName);
+            cout << "File Size = " << fileSize << endl;
+            int numBlocks = ceil(fileSize * 1.0 / 512); 
+            int currentBlock = 1;
+
+            do
+            {
+                int bytesRead = fread(fileData, 1, 512, fp); 
+                cout << "Block Number = " << currentBlock << ", ";
+                cout << "Bytes read = " << bytesRead << endl;
+                fileData[bytesRead] = '\0';
+                cout << "Size of filedata = " << strlen(fileData) << endl;
+                char *dataBuf = createTFTPHeader(DATA, fileData, currentBlock);
+                // Send data to client
+                int sentBytes = sendto(sockFd, dataBuf, strlen(fileData) + 4, 0,
+                        (struct sockaddr*)&clientAddr, sizeof(struct sockaddr_storage));
+                // Wait for ACK from client
+                if ((numBytes = recvfrom(sockFd, buf, MAXDATASIZE-1, 0, 
+                                (struct sockaddr*)&clientAddr, &sin_size)) == -1)
+                {
+                    perror("recvfrom");
+                    exit(1);
+                }
+
+                // Check the received header's opcode
+                unsigned short opcodeNetOrder;
+                memcpy(&opcodeNetOrder, buf, sizeof(unsigned short));
+                unsigned short opCodeHostOrder = ntohs(opcodeNetOrder);
+
+                if (opCodeHostOrder == 4)
+                {
+                    // ACK
+                    unsigned short blockNumNetOrder;
+                    memcpy(&blockNumNetOrder, buf+2, sizeof(unsigned short));
+                    unsigned short blockNumHostOrder = ntohs(blockNumNetOrder);
+                    if (blockNumHostOrder == currentBlock)
+                    {
+                        cout << "ACK received for block " << currentBlock << endl;
+                    }
+
+                }
+                currentBlock += 1;
+
+            } while(currentBlock <= numBlocks);
+
+        }
+
+#if 0
        read_fds = master;
        if (select(fdMax + 1, &read_fds, NULL, NULL, &tv) == -1)
        {
@@ -322,6 +411,7 @@ int Server::acceptConnection()
                }
            }
        }
+#endif
     }
     return 0;
 }
@@ -349,15 +439,15 @@ std::string Server::getUserInfo()
 
 int main(int argc, char *argv[])
 {
-    if (argc != 4)
+    if (argc != 3)
     {
-       fprintf(stderr, "Usage: server <server IP> <server PORT> <max clients>\n");
+       fprintf(stderr, "Usage: server <server IP> <server PORT>\n");
        exit(1);
     }
 
-    Server *s = new Server(argv[1], argv[2], atoi(argv[3]));
+    Server *s = new Server(argv[1], argv[2]);
     s->createSocketAndBind();
-    s->listenForConnections();
+    //s->listenForConnections();
 
     printf("Chat server is waiting for incoming connections...\n");
     s->acceptConnection();

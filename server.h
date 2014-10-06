@@ -15,7 +15,9 @@
 #include <signal.h>
 #include <map>
 #include "helper.h"
+#include <math.h>
 #include <string>
+#include <fstream>
 
 #define PORT "3490"
 #define BACKLOG 10
@@ -35,7 +37,7 @@ class Server
         std::map<string, UserStatusT> userStatusMap;
 
     public:
-        Server(char *serverIP, char *portNum, int maxConns);
+        Server(char *serverIP, char *portNum);
         int createSocketAndBind();
         int listenForConnections();
         int acceptConnection();
