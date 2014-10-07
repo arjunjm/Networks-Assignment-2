@@ -5,6 +5,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <list>
+#include <iostream>
 
 using namespace std;
 
@@ -23,13 +24,34 @@ typedef enum TFTPHeaderType
     ERR  = 5
 } TFTPHeaderTypeT;
 
-char * createTFTPHeader(TFTPHeaderTypeT hType, char *payload = NULL, int blockNum = 0, int errorNo = 0)
+TFTPHeaderTypeT getHeaderType(char *buf)
+{
+    unsigned short opcodeNetOrder;
+    memcpy(&opcodeNetOrder, buf, sizeof(unsigned short));
+    unsigned short opCodeHostOrder = ntohs(opcodeNetOrder);
+    return (TFTPHeaderTypeT) opCodeHostOrder;
+}
+
+char * createTFTPHeader(TFTPHeaderTypeT hType, char *payload = NULL, int bytesRead =0, int blockNum = 0, int errorNo = 0)
 {
     switch(hType)
     {
         case RRQ:
         case WRQ:
         case ACKN:
+            {
+                char *dataBuf = new char[4];
+                unsigned short ackOpcode = (int) hType;
+                unsigned short blockNo   = blockNum;
+
+                // Convert to network byte order
+                unsigned short ackOpcodeNetOrder = htons(ackOpcode);
+                unsigned short blockNumNetOrder  = htons(blockNo);
+                memcpy(dataBuf, &ackOpcodeNetOrder, 2);
+                memcpy(dataBuf+2, &blockNumNetOrder, 2);
+                return dataBuf;
+            }
+
         case ERR:
             {
                 char *buf = new char[4+strlen(payload)+1];
@@ -56,39 +78,19 @@ char * createTFTPHeader(TFTPHeaderTypeT hType, char *payload = NULL, int blockNu
                 unsigned short blockNumNetOrder = htons(blockNo);
                 memcpy(dataBuf,   &dataOpCodeNetOrder, 2);
                 memcpy(dataBuf+2, &blockNumNetOrder, 2);
-                memcpy(dataBuf+4, payload, strlen(payload));
+                if (payload != NULL)
+                {
+                    memcpy(dataBuf+4, payload, bytesRead);
+                }
+                else
+                {
+                    cout << "Payload is NULL " << endl;
+                }
                 return dataBuf;
             }
    }
    return NULL;
 }
-
-typedef struct TFTPClientMessage 
-{
-    short opcode;
-    char fileName[10];
-    char mode[10];
-}  __attribute__((packed)) TFTPClientMessageT;
-
-typedef struct TFTPDataMessage
-{
-    short opcode;
-    short blockNumber;
-    char data[512];
-}  __attribute__((packed)) TFTPDataMessageT;
-
-typedef struct TFTPAckMessage
-{
-    short opcode;
-    short blockNumber;
-}  __attribute__((packed)) TFTPAckMessageT;
-
-typedef struct TFTPErrMessage
-{
-    short opcode;
-    short errNumber;
-    char  *errMessage;
-}  __attribute__((packed)) TFTPErrMessageT;
 
 int getFileSize(const char* fileName)
 {
@@ -101,55 +103,6 @@ int getFileSize(const char* fileName)
 
     return -1;
 }
-
-typedef enum UserStatus
-{
-    ONLINE,
-    OFFLINE,
-    IDLE
-} UserStatusT;
-
-typedef enum AttributeType
-{
-   ATTR_REASON,
-   ATTR_USER,
-   ATTR_CLI_CNT,
-   ATTR_MSG
-} AttributeTypeT;
-
-typedef enum SBMPMessageType
-{
-    JOIN = 2,
-    FWD  = 3,
-    SEND = 4,
-    ACK = 5,
-    NACK = 6,
-    ONLINE_INFO = 7,
-    OFFLINE_INFO = 8
-} SBMPMessageTypeT;
-
-typedef union
-{
-    char username[16];
-    char message[512];
-    char reason[32];
-    unsigned short clientCount;
-}Payload;
-
-typedef struct SBMPAttribute
-{
-    AttributeTypeT type;
-    unsigned short length;
-    Payload payload;
-} __attribute__((packed)) SBMPAttributeT;
-
-typedef struct SBMPHeader
-{
-    unsigned int version : 9;
-    unsigned int type : 7;
-    unsigned short length;
-    SBMPAttributeT attributes[2];
-} __attribute__((packed)) SBMPHeaderT;
 
 void sigchld_handler(int s)
 {
@@ -166,156 +119,4 @@ void *get_in_addr(struct sockaddr *sa)
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-SBMPHeaderT* createMessagePacket(SBMPMessageTypeT msgType, const char *userName, const char *msg)
-{
-    SBMPAttributeT sbmpAttr;
-    SBMPHeaderT *sbmpHeader;
-
-    switch(msgType)
-    {
-        case JOIN:
-
-            /*
-             * Fill in the SBMP Attribute struct
-             */   
-
-            sbmpAttr.type = ATTR_USER;
-            strcpy(sbmpAttr.payload.username, userName);
-            sbmpAttr.length = strlen(sbmpAttr.payload.username) + 4;
-
-            /*
-             * Fill in the SBMP Header struct
-             */
-
-            sbmpHeader = new SBMPHeaderT();
-            sbmpHeader->version = 1;
-            sbmpHeader->type = (int)JOIN;
-            sbmpHeader->length = sbmpAttr.length + 4;
-            sbmpHeader->attributes[0] = sbmpAttr;
-
-            break;
-        
-        case FWD:
-
-            /*
-             * Fill in the SBMP Attribute struct
-             */   
-
-            SBMPAttributeT sbmpUserAttr;
-            sbmpUserAttr.type = ATTR_USER;
-            strcpy(sbmpUserAttr.payload.username, userName);
-            sbmpUserAttr.length = strlen(sbmpUserAttr.payload.username) + 4;
-
-            sbmpAttr.type = ATTR_MSG;
-            strcpy(sbmpAttr.payload.message, msg);
-            sbmpAttr.length = strlen(sbmpAttr.payload.message) + 4;
-
-            /*
-             * Fill in the SBMP Header struct
-             */
-
-            sbmpHeader = new SBMPHeaderT();
-            sbmpHeader->version = 1;
-            sbmpHeader->type = (int)FWD;
-            sbmpHeader->length = sbmpAttr.length + 4;
-            sbmpHeader->attributes[0] = sbmpUserAttr;
-            sbmpHeader->attributes[1] = sbmpAttr;
-
-            break;
-
-        case SEND:
-
-            /*
-             * Fill in the SBMP Attribute struct
-             */   
-
-            sbmpAttr.type = ATTR_MSG;
-            strcpy(sbmpAttr.payload.message, msg);
-            sbmpAttr.length = strlen(sbmpAttr.payload.message) + 4;
-
-            /*
-             * Fill in the SBMP Header struct
-             */
-
-            sbmpHeader = new SBMPHeaderT();
-            sbmpHeader->version = 1;
-            sbmpHeader->type = (int)SEND;
-            sbmpHeader->length = sbmpAttr.length + 4;
-            sbmpHeader->attributes[0] = sbmpAttr;
-
-            break;
-
-        case ACK:
-            /*
-             * Fill in the SBMP Attribute struct
-             */   
-
-            sbmpAttr.type = ATTR_MSG;
-            strcpy(sbmpAttr.payload.message, msg);
-            sbmpAttr.length = strlen(sbmpAttr.payload.message) + 4;
-
-            /*
-             * Fill in the SBMP Header struct
-             */
-
-            sbmpHeader = new SBMPHeaderT();
-            sbmpHeader->version = 1;
-            sbmpHeader->type = (int)ACK;
-            sbmpHeader->length = sbmpAttr.length + 4;
-            sbmpHeader->attributes[0] = sbmpAttr;
-
-            break;
-
-        case NACK:
-            /*
-             * Fill in the SBMP Attribute struct
-             */   
-
-            sbmpAttr.type = ATTR_REASON;
-            strcpy(sbmpAttr.payload.message, msg);
-            sbmpAttr.length = strlen(sbmpAttr.payload.message) + 4;
-
-            /*
-             * Fill in the SBMP Header struct
-             */
-
-            sbmpHeader = new SBMPHeaderT();
-            sbmpHeader->version = 1;
-            sbmpHeader->type = (int)NACK;
-            sbmpHeader->length = sbmpAttr.length + 4;
-            sbmpHeader->attributes[0] = sbmpAttr;
-
-
-            break;
-
-        case OFFLINE_INFO:
-        case ONLINE_INFO:
-            /*
-             * Fill in the SBMP Attribute struct
-             */   
-
-            sbmpAttr.type = ATTR_MSG;
-            strcpy(sbmpAttr.payload.message, msg);
-            sbmpAttr.length = strlen(sbmpAttr.payload.message) + 4;
-
-            /*
-             * Fill in the SBMP Header struct
-             */
-
-            sbmpHeader = new SBMPHeaderT();
-            sbmpHeader->version = 1;
-            sbmpHeader->type = (int)msgType;
-            sbmpHeader->length = sbmpAttr.length + 4;
-            sbmpHeader->attributes[0] = sbmpAttr;
-
-            break;
-
-        default:
-            printf("Error!!!Did not match any known message types. Exiting");
-            exit(1);
-    }
-    return sbmpHeader;
-}
-
-
-#endif /* __ELPER_H__ */
+#endif /* __HELPER_H__ */

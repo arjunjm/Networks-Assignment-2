@@ -73,22 +73,6 @@ int Server::createSocketAndBind()
     }
 }
 
-int Server::listenForConnections()
-{
-    if(listen(sockFd, maxConnections) == -1)
-    {
-        perror("Error while listening");
-        exit(1);
-    }
-    return 0;
-}
-
-int Server::sendData(int sockFD, void * buf, size_t len, int flags)
-{
-    int retVal;
-    retVal = send(sockFD, buf, len, flags);
-    return retVal;
-}
 
 /*
 void printMap(std::map<int, string> myMap)
@@ -100,89 +84,10 @@ void printMap(std::map<int, string> myMap)
     }
 }
 */
-int Server::recvData(int sockFD, SBMPMessageType &msgType, char *message)
-{
-    int numBytes;
-    SBMPHeaderT *recvHeader = new SBMPHeaderT();
-    numBytes = recv(sockFD, recvHeader, sizeof(SBMPHeaderT)-1, 0);
-    if (numBytes == -1)
-    {
-        perror("Error in receiving data from the client");
-        exit(1);
-    }
-
-    msgType = (SBMPMessageTypeT) recvHeader->type;
-
-    switch(msgType) 
-    {
-        case JOIN:
-            {
-                if (userStatusMap.size() >= maxConnections)
-                {
-                    std::string connFailReason("Maximum number of connections reached");
-                    cout << connFailReason << endl;
-                    SBMPHeaderT *sbmpHeader = createMessagePacket(NACK, NULL, connFailReason.c_str());
-                    if (sendData(sockFD, sbmpHeader, sizeof(SBMPHeaderT), 0) == -1)
-                    {
-                        perror("Error while sending NACK");
-                    }
-                    return 0;
-                }
-
-                string userName(recvHeader->attributes[0].payload.username);
-                if (userStatusMap.find(userName) == userStatusMap.end())
-                {
-                    cout << userName << " has joined the chat session" << endl;
-                    userStatusMap[userName] = ONLINE;
-                    fdUserMap[sockFD] = userName;
-                }
-                else
-                {
-                    std::string connFailReason("Username already in use");
-                    cout <<  "The user has already connected\n";
-                    SBMPHeaderT *sbmpHeader = createMessagePacket(NACK, NULL, connFailReason.c_str());
-                    if (sendData(sockFD, sbmpHeader, sizeof(SBMPHeaderT), 0) == -1)
-                    {
-                        perror("Error while sending NACK");
-                    }
-                    return 0;
-                }
-
-                /*
-                 * Send ACK with currently online user information
-                 */
-                std::string userInfo = getUserInfo();
-                SBMPHeaderT *sbmpHeader = createMessagePacket(ACK, NULL, userInfo.c_str());
-                if (sendData(sockFD, sbmpHeader, sizeof(SBMPHeaderT), 0) == -1)
-                {
-                    perror("Error while sending ACK");
-                }
-            }
-            break;
-
-        case FWD:
-            break;
-
-        case SEND:
-            {
-                strcpy(message, recvHeader->attributes[0].payload.message);
-                cout << "Received message from " << fdUserMap[sockFD] << ": [" << message << "]. Forwarding message to other clients" << endl;
-            }
-            break;
-
-        case ACK:
-        case NACK:
-        case ONLINE_INFO:
-        case OFFLINE_INFO:
-            break;
-
-    }
-    
-    return numBytes;
-}
 
 int Server::acceptConnection()
 {
+    TFTPHeaderTypeT headerType;
     struct sockaddr_storage clientAddr;
     socklen_t sin_size;
     char ipAddr[INET6_ADDRSTRLEN]; 
@@ -210,6 +115,11 @@ int Server::acceptConnection()
         }
         else
         {
+            // Check the received header's opcode
+            headerType = getHeaderType(buf);
+            if (headerType != RRQ)
+                continue;
+
             char *fileName = new char();
             int i = 0;
             int offset = sizeof(short);
@@ -232,30 +142,34 @@ int Server::acceptConnection()
                  * Sending ERR TFTP Header
                  */
                 char errMessage[30] = "No such file or directory";
-                char *errPacket = createTFTPHeader(ERR, errMessage, 0, errno);
+                char *errPacket = createTFTPHeader(ERR, errMessage, strlen(errMessage), 0, errno);
                 int sentBytes = sendto(sockFd, errPacket, strlen(errMessage) + 4, 0,
                         (struct sockaddr*)&clientAddr, sizeof(struct sockaddr_storage));
                 continue;
             }
 
             char fileData[512];
-            bzero(fileData, 512);
             int fileSize  = getFileSize(fileName);
-            cout << "File Size = " << fileSize << endl;
+            bool lastAckRequired = false;
             int numBlocks = ceil(fileSize * 1.0 / 512); 
             int currentBlock = 1;
 
-            do
+            if (fileSize % 512 == 0)
+            {
+                lastAckRequired = true;
+                numBlocks += 1;
+            }
+
+            while(1)
             {
                 int bytesRead = fread(fileData, 1, 512, fp); 
-                cout << "Block Number = " << currentBlock << ", ";
-                cout << "Bytes read = " << bytesRead << endl;
-                fileData[bytesRead] = '\0';
-                cout << "Size of filedata = " << strlen(fileData) << endl;
-                char *dataBuf = createTFTPHeader(DATA, fileData, currentBlock);
+                // Create TFTP Header
+                char *dataBuf = createTFTPHeader(DATA, fileData, bytesRead, currentBlock);
+
                 // Send data to client
-                int sentBytes = sendto(sockFd, dataBuf, strlen(fileData) + 4, 0,
+                int sentBytes = sendto(sockFd, dataBuf, bytesRead + 4, 0,
                         (struct sockaddr*)&clientAddr, sizeof(struct sockaddr_storage));
+
                 // Wait for ACK from client
                 if ((numBytes = recvfrom(sockFd, buf, MAXDATASIZE-1, 0, 
                                 (struct sockaddr*)&clientAddr, &sin_size)) == -1)
@@ -265,11 +179,9 @@ int Server::acceptConnection()
                 }
 
                 // Check the received header's opcode
-                unsigned short opcodeNetOrder;
-                memcpy(&opcodeNetOrder, buf, sizeof(unsigned short));
-                unsigned short opCodeHostOrder = ntohs(opcodeNetOrder);
+                headerType = getHeaderType(buf);
 
-                if (opCodeHostOrder == 4)
+                if (headerType == ACKN)
                 {
                     // ACK
                     unsigned short blockNumNetOrder;
@@ -277,14 +189,37 @@ int Server::acceptConnection()
                     unsigned short blockNumHostOrder = ntohs(blockNumNetOrder);
                     if (blockNumHostOrder == currentBlock)
                     {
-                        cout << "ACK received for block " << currentBlock << endl;
+                        //cout << "ACK received for block " << currentBlock << endl;
                     }
 
                 }
                 currentBlock += 1;
 
-            } while(currentBlock <= numBlocks);
+                if(currentBlock > numBlocks)
+                    break;
 
+            }
+            /*
+            if (lastAckRequired)
+            {
+                char *dataBuf = createTFTPHeader(DATA, NULL, numBlocks);
+                // Send data to client
+                sendto(sockFd, dataBuf, 4, 0, (struct sockaddr*)&clientAddr, 
+                        sizeof(struct sockaddr_storage));
+
+                // Wait for ACK from client
+                if ((numBytes = recvfrom(sockFd, buf, MAXDATASIZE-1, 0, 
+                                (struct sockaddr*)&clientAddr, &sin_size)) == -1)
+                {
+                    perror("recvfrom");
+                    exit(1);
+                }
+                else
+                {
+                    cout << " Got ack..terminating now \n";
+                }
+
+            }*/
         }
 
 #if 0
@@ -416,27 +351,6 @@ int Server::acceptConnection()
     return 0;
 }
 
-std::string Server::getUserInfo()
-{
-    int count = fdUserMap.size();
-
-    std::stringstream countStr;
-    countStr << count;
-    string clientCountStr = countStr.str(); 
-
-    std::string userInfo;
-    userInfo.append(clientCountStr);
-    
-    std::map<int, string>::iterator it;
-    
-    for (it = fdUserMap.begin(); it != fdUserMap.end(); it++)
-    {
-        userInfo.append(" ");
-        userInfo.append(it->second);
-    }
-    return userInfo;
-}
-
 int main(int argc, char *argv[])
 {
     if (argc != 3)
@@ -449,7 +363,7 @@ int main(int argc, char *argv[])
     s->createSocketAndBind();
     //s->listenForConnections();
 
-    printf("Chat server is waiting for incoming connections...\n");
+    printf("TFTP Server is now online...\n");
     s->acceptConnection();
     return 0;
 }
