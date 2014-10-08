@@ -28,10 +28,11 @@ class Server
 {
     private:
         struct addrinfo hints;
+        int nextFreePort;
         int sockFd;
-        int newConnFd;
         char serverIP[20];
         char portNum[10];
+        std::map<int, TransferInfoT> fdTransferInfoMap;
 
     public:
         Server(char *serverIP, char *portNum);

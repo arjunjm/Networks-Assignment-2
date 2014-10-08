@@ -12,6 +12,7 @@ Server::Server(char *servIP, char *portNum)
 {
     strcpy(this->serverIP, servIP);
     strcpy(this->portNum, portNum);
+    nextFreePort = atoi(this->portNum) + 1;
 
     memset(&this->hints, 0, sizeof hints);
     this->hints.ai_family = AF_UNSPEC;
@@ -87,6 +88,7 @@ void printMap(std::map<int, string> myMap)
 
 int Server::acceptConnection()
 {
+    int newConnFd;
     TFTPHeaderTypeT headerType;
     struct sockaddr_storage clientAddr;
     socklen_t sin_size;
@@ -106,248 +108,187 @@ int Server::acceptConnection()
 
     while(1)
     {
-        sin_size = sizeof clientAddr;
-        if ((numBytes = recvfrom(sockFd, buf, MAXDATASIZE-1, 0, 
-                    (struct sockaddr*)&clientAddr, &sin_size)) == -1)
+        read_fds = master;
+        if (select(fdMax + 1, &read_fds, NULL, NULL, &tv) == -1)
         {
-            perror("recvfrom");
-            exit(1);
+            perror("Select");
+            exit(4);
         }
-        else
+
+        /*
+         * Check if there is a new incoming connection or if 
+         * there are any ACKs from existing clients
+         */
+        for (int i = 0; i <= fdMax; i++)
         {
-            // Check the received header's opcode
-            headerType = getHeaderType(buf);
-            if (headerType != RRQ)
-                continue;
-
-            char *fileName = new char();
-            int i = 0;
-            int offset = sizeof(short);
-            while (true)
+            if (FD_ISSET(i, &read_fds))
             {
-                if (buf[i + offset] == '\0')
-                    break;
-                fileName[i] = buf[i + offset];
-                i++;
-            }
-            fileName[i] = '\0';
-
-            // Get File Size
-            FILE *fp = fopen(fileName, "rb"); 
-            if (fp == NULL)
-            {
-                perror("Error while trying to open file");
-
-                /*
-                 * Sending ERR TFTP Header
-                 */
-                char errMessage[30] = "No such file or directory";
-                char *errPacket = createTFTPHeader(ERR, errMessage, strlen(errMessage), 0, errno);
-                int sentBytes = sendto(sockFd, errPacket, strlen(errMessage) + 4, 0,
-                        (struct sockaddr*)&clientAddr, sizeof(struct sockaddr_storage));
-                continue;
-            }
-
-            char fileData[512];
-            int fileSize  = getFileSize(fileName);
-            bool lastAckRequired = false;
-            int numBlocks = ceil(fileSize * 1.0 / 512); 
-            int currentBlock = 1;
-
-            if (fileSize % 512 == 0)
-            {
-                lastAckRequired = true;
-                numBlocks += 1;
-            }
-
-            while(1)
-            {
-                int bytesRead = fread(fileData, 1, 512, fp); 
-                // Create TFTP Header
-                char *dataBuf = createTFTPHeader(DATA, fileData, bytesRead, currentBlock);
-
-                // Send data to client
-                int sentBytes = sendto(sockFd, dataBuf, bytesRead + 4, 0,
-                        (struct sockaddr*)&clientAddr, sizeof(struct sockaddr_storage));
-
-                // Wait for ACK from client
-                if ((numBytes = recvfrom(sockFd, buf, MAXDATASIZE-1, 0, 
-                                (struct sockaddr*)&clientAddr, &sin_size)) == -1)
+                if (i == sockFd)
+                    /*
+                     * This is the listening socket. 
+                     * Check new incoming connections.
+                     */
                 {
-                    perror("recvfrom");
-                    exit(1);
-                }
-
-                // Check the received header's opcode
-                headerType = getHeaderType(buf);
-
-                if (headerType == ACKN)
-                {
-                    // ACK
-                    unsigned short blockNumNetOrder;
-                    memcpy(&blockNumNetOrder, buf+2, sizeof(unsigned short));
-                    unsigned short blockNumHostOrder = ntohs(blockNumNetOrder);
-                    if (blockNumHostOrder == currentBlock)
+                    sin_size = sizeof clientAddr;
+                    if ((numBytes = recvfrom(sockFd, buf, MAXDATASIZE-1, 0, 
+                                    (struct sockaddr*)&clientAddr, &sin_size)) == -1)
                     {
-                        //cout << "ACK received for block " << currentBlock << endl;
+                        perror("recvfrom");
+                        continue;
+                    }
+
+                    // Check the received header's opcode
+                    headerType = getHeaderType(buf);
+                    if (headerType != RRQ)
+                        continue;
+
+                    char *fileName = new char();
+                    int i = 0;
+                    int offset = sizeof(short);
+                    while (true)
+                    {
+                        if (buf[i + offset] == '\0')
+                            break;
+                        fileName[i] = buf[i + offset];
+                        i++;
+                    }
+                    fileName[i] = '\0';
+
+                    cout << "Filename = " << fileName << endl;
+                    // Get File Size
+                    FILE *fp = fopen(fileName, "rb"); 
+                    if (fp == NULL)
+                    {
+                        perror("Error while trying to open file");
+
+                        /*
+                         * Sending ERR TFTP Header
+                         */
+                        char errMessage[30] = "No such file or directory";
+                        char *errPacket = createTFTPHeader(ERR, errMessage, strlen(errMessage), 0, errno);
+                        sendto(sockFd, errPacket, strlen(errMessage) + 4, 0,
+                                (struct sockaddr*)&clientAddr, sizeof(struct sockaddr_storage));
+                        continue;
+                    }
+
+
+                    // Create a new socket for communicating with the client
+                    newConnFd = socket(AF_INET, SOCK_DGRAM, 0);
+                    if (newConnFd == -1)
+                    {
+                        perror("Error in creating a new socket..");
+                    }
+                    else
+                    {
+                        /*
+                         * Bind the socket to the next available port
+                         */
+                        struct sockaddr_in newClient = *((struct sockaddr_in*)&clientAddr);
+                        newClient.sin_port = htons(nextFreePort);
+
+                        if(bind(newConnFd, (sockaddr*)&newClient, sin_size) == - 1)
+                        {
+                            close(newConnFd);
+                            perror("Server: Unable to bind");
+                            continue;
+                        }
+
+                        nextFreePort++;
+                        FD_SET(newConnFd, &master);
+
+                        if (newConnFd > fdMax)
+                        {
+                            fdMax = newConnFd;
+                        }
+
+                        /*
+                         * The following piece of code fills the TransferInfo struct and adds an entry in the FDTransferInfo Map.
+                         * We also send 1 packet to the client here using the newly created socket
+                         */
+                        int fileSize = getFileSize(fileName); 
+                        int numBlocks = ceil(fileSize * 1.0 / 512); 
+
+                        if (fileSize % 512 == 0)
+                        {
+                            numBlocks += 1;
+                        }
+                        TransferInfoT tInfo;
+                        tInfo.filep = fp; 
+                        tInfo.numBlocks = numBlocks;
+                        tInfo.currentBlock = 1;
+                        tInfo.clientAddr = newClient;
+
+                        fdTransferInfoMap[newConnFd] = tInfo; 
+
+                        char fileData[512];
+                        int bytesRead = fread(fileData, 1, 512, fdTransferInfoMap[newConnFd].filep);
+                        // Create TFTP Header
+                        char *dataBuf = createTFTPHeader(DATA, fileData, bytesRead, fdTransferInfoMap[newConnFd].currentBlock);
+
+                        // Send data to the client using the new socket FD
+                        cout << " Sending bytes to client " << endl;
+                        //int sendBytes = sendto(newConnFd, dataBuf, bytesRead + 4, 0,
+                        //        (struct sockaddr*)&fdTransferInfoMap[i].clientAddr, sizeof(struct sockaddr_storage));
+                        int sendBytes = sendto(newConnFd, dataBuf, bytesRead + 4, 0,
+                                (struct sockaddr*)&clientAddr, sizeof(struct sockaddr_storage));
+
                     }
 
                 }
-                currentBlock += 1;
-
-                if(currentBlock > numBlocks)
-                    break;
-
-            }
-            /*
-            if (lastAckRequired)
-            {
-                char *dataBuf = createTFTPHeader(DATA, NULL, numBlocks);
-                // Send data to client
-                sendto(sockFd, dataBuf, 4, 0, (struct sockaddr*)&clientAddr, 
-                        sizeof(struct sockaddr_storage));
-
-                // Wait for ACK from client
-                if ((numBytes = recvfrom(sockFd, buf, MAXDATASIZE-1, 0, 
-                                (struct sockaddr*)&clientAddr, &sin_size)) == -1)
-                {
-                    perror("recvfrom");
-                    exit(1);
-                }
                 else
                 {
-                    cout << " Got ack..terminating now \n";
+                    /*
+                     * Get ACK from the client and transmit the next block.
+                     */
+                    if ((numBytes = recvfrom(i, buf, MAXDATASIZE-1, 0, 
+                                    (struct sockaddr*)&fdTransferInfoMap[i].clientAddr, &sin_size)) == -1)
+                    {
+                        perror("recvfrom");
+                        exit(1);
+                    }
+
+                    // Check the received header's opcode
+                    headerType = getHeaderType(buf);
+
+                    if (headerType == ACKN)
+                    {
+                        unsigned short blockNumNetOrder;
+                        memcpy(&blockNumNetOrder, buf+2, sizeof(unsigned short));
+                        unsigned short blockNumHostOrder = ntohs(blockNumNetOrder);
+                        if (blockNumHostOrder == fdTransferInfoMap[i].currentBlock)
+                        {
+                            cout << "ACK received for block " << fdTransferInfoMap[i].currentBlock << endl;
+                        }
+
+                    }
+
+                    fdTransferInfoMap[i].currentBlock += 1;
+
+                    if (fdTransferInfoMap[i].currentBlock > fdTransferInfoMap[i].numBlocks)
+                    {
+                        FD_CLR(i, &master);
+                        fdTransferInfoMap.erase(i);
+                        //close(i);
+                        break;
+                    }
+
+                    char fileData[512];
+                    int bytesRead = fread(fileData, 1, 512, fdTransferInfoMap[i].filep);
+
+                        //Create TFTP Header
+                    char *dataBuf = createTFTPHeader(DATA, fileData, bytesRead, fdTransferInfoMap[i].currentBlock);
+
+                    // Send the data
+                    sendto(i, dataBuf, bytesRead + 4, 0,
+                            (struct sockaddr*)&fdTransferInfoMap[i].clientAddr, sizeof(struct sockaddr_storage)); 
+
+
+
+
                 }
-
-            }*/
+            }
         }
-
-#if 0
-       read_fds = master;
-       if (select(fdMax + 1, &read_fds, NULL, NULL, &tv) == -1)
-       {
-           perror("Select");
-           exit(4);
-       }
-
-       /*
-        * Run through existing connections and check if a client is ready
-        */
-       for (int i = 0; i <= fdMax; i++)
-       {
-           if (FD_ISSET(i, &read_fds))
-           {
-               if (i == sockFd)
-               /*
-                * This is the listening socket. 
-                * Check new incoming connections.
-                */
-               {
-                   sin_size = sizeof clientAddr;
-                   newConnFd = accept(i, (struct sockaddr *)&clientAddr, &sin_size);
-                   if (newConnFd == -1)
-                   {
-                       perror("Error while accepting connection..");
-                   }
-                   else
-                   {
-                       FD_SET(newConnFd, &master);
-
-                       if (newConnFd > fdMax)
-                       {
-                           fdMax = newConnFd;
-                       }
-                       inet_ntop(clientAddr.ss_family, get_in_addr((struct sockaddr *)&clientAddr), ipAddr, sizeof ipAddr);
-
-
-                   }
-
-               }
-               else
-               {
-                   /*
-                    * Handle data from client connection.
-                    */
-                   int readBytes;
-                   SBMPMessageType msgType;
-                   char *message = new char[512];
-                   if ((readBytes = recvData(i, msgType, message)) <= 0)
-                   {
-                        /*
-                         * This means either there was a error in receiving data
-                         * or that the client has closed the connection.
-                         */
-                        if (readBytes == 0)
-                        {
-                            if (fdUserMap[i] != "")
-                            {
-                                string leftMsg = fdUserMap[i] + " has left the chat session.\n";
-                                cout << leftMsg;
-                                cout << "Connection closed\n";
-
-                                for (int j = 0; j <= fdMax; j++)
-                                {
-                                    if (FD_ISSET (j, &master))
-                                    {
-                                        if ((j != i) && (j != sockFd))
-                                        {
-                                            SBMPHeaderT *sbmpHeader = createMessagePacket(OFFLINE_INFO, NULL, leftMsg.c_str());
-                                            if (sendData(j, sbmpHeader, sizeof(SBMPHeaderT), 0) == -1)
-                                                perror("Error while broadcasting message");
-                                        }
-                                    }
-                                }
-                            }
-                            // Close the connection
-                            FD_CLR(i, &master);
-                            userStatusMap.erase(fdUserMap[i]);
-                            fdUserMap.erase(i);
-                            close(i);
-                        }
-                        else
-                        {
-                            perror("receive");
-                        }
-                   }
-                   else
-                   {
-                       /*
-                        * Client is sending actual data.
-                        */
-                       const char* userName = fdUserMap[i].c_str();
-                       for (int j = 0; j <= fdMax; j++)
-                       {
-                           if (FD_ISSET (j, &master))
-                           {
-                               if ((j != i) && (j != sockFd))
-                               {
-                                   if (msgType == SEND)
-                                   {
-                                       SBMPHeaderT *sbmpHeader = createMessagePacket(FWD, userName, message);
-                                       if (sendData(j, sbmpHeader, sizeof(SBMPHeaderT), 0) == -1)
-                                           perror("Error while broadcasting message");
-                                   }
-                                   else if (msgType == JOIN)
-                                   {
-                                       string enterMsg;
-                                       enterMsg.append(userName);
-                                       enterMsg.append(" has entered the chat session");
-                                       SBMPHeaderT *sbmpHeader = createMessagePacket(ONLINE_INFO, NULL, enterMsg.c_str());
-                                       if (sendData(j, sbmpHeader, sizeof(SBMPHeaderT), 0) == -1)
-                                           perror("Error while broadcasting message");
-
-                                   }
-                               }
-                           }
-                       }
-                       delete [] message;
-                        
-                   }
-               }
-           }
-       }
-#endif
-    }
+    }   
     return 0;
 }
 

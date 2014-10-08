@@ -24,6 +24,14 @@ typedef enum TFTPHeaderType
     ERR  = 5
 } TFTPHeaderTypeT;
 
+typedef struct TransferInfo
+{
+    FILE *filep;
+    int numBlocks;
+    int currentBlock;
+    struct sockaddr_in clientAddr;
+} TransferInfoT;
+
 TFTPHeaderTypeT getHeaderType(char *buf)
 {
     unsigned short opcodeNetOrder;
@@ -36,8 +44,11 @@ char * createTFTPHeader(TFTPHeaderTypeT hType, char *payload = NULL, int bytesRe
 {
     switch(hType)
     {
+        /* The server does not issue these requests */
         case RRQ:
         case WRQ:
+            break;
+
         case ACKN:
             {
                 char *dataBuf = new char[4];
@@ -81,10 +92,6 @@ char * createTFTPHeader(TFTPHeaderTypeT hType, char *payload = NULL, int bytesRe
                 if (payload != NULL)
                 {
                     memcpy(dataBuf+4, payload, bytesRead);
-                }
-                else
-                {
-                    cout << "Payload is NULL " << endl;
                 }
                 return dataBuf;
             }
