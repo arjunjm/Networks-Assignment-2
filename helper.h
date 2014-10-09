@@ -4,10 +4,14 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <list>
 #include <iostream>
 
 using namespace std;
+
+// Time out in milliseconds
+#define TIMEOUT 10.0
 
 #define MAXDATASIZE 512 
 #define STDIN 0
@@ -29,6 +33,9 @@ typedef struct TransferInfo
     FILE *filep;
     int numBlocks;
     int currentBlock;
+    time_t timeLastAckRecvd;
+    int bytesRead;
+    char *lastPacketSent;
     struct sockaddr_in clientAddr;
 } TransferInfoT;
 

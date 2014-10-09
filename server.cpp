@@ -92,14 +92,16 @@ int Server::acceptConnection()
     TFTPHeaderTypeT headerType;
     struct sockaddr_storage clientAddr;
     socklen_t sin_size;
-    char ipAddr[INET6_ADDRSTRLEN]; 
+    //char ipAddr[INET6_ADDRSTRLEN]; 
     char buf[MAXDATASIZE];
     int numBytes;
     fd_set master, read_fds;
     int fdMax;
+    /*
     struct timeval tv;
-    tv.tv_sec = 50;
+    tv.tv_sec = 100;
     tv.tv_usec = 500000;
+    */
     FD_ZERO(&master);
     FD_ZERO(&read_fds);
 
@@ -109,7 +111,7 @@ int Server::acceptConnection()
     while(1)
     {
         read_fds = master;
-        if (select(fdMax + 1, &read_fds, NULL, NULL, &tv) == -1)
+        if (select(fdMax + 1, &read_fds, NULL, NULL, NULL) == -1)
         {
             perror("Select");
             exit(4);
@@ -216,6 +218,7 @@ int Server::acceptConnection()
                         tInfo.filep = fp; 
                         tInfo.numBlocks = numBlocks;
                         tInfo.currentBlock = 1;
+                        tInfo.timeLastAckRecvd = time(NULL);
                         tInfo.clientAddr = newClient;
 
                         fdTransferInfoMap[newConnFd] = tInfo; 
@@ -225,11 +228,11 @@ int Server::acceptConnection()
                         // Create TFTP Header
                         char *dataBuf = createTFTPHeader(DATA, fileData, bytesRead, fdTransferInfoMap[newConnFd].currentBlock);
 
+                        fdTransferInfoMap[newConnFd].bytesRead= bytesRead;
+                        fdTransferInfoMap[newConnFd].lastPacketSent = dataBuf;
+
                         // Send data to the client using the new socket FD
-                        cout << " Sending bytes to client " << endl;
-                        //int sendBytes = sendto(newConnFd, dataBuf, bytesRead + 4, 0,
-                        //        (struct sockaddr*)&fdTransferInfoMap[i].clientAddr, sizeof(struct sockaddr_storage));
-                        int sendBytes = sendto(newConnFd, dataBuf, bytesRead + 4, 0,
+                        sendto(newConnFd, dataBuf, bytesRead + 4, 0,
                                 (struct sockaddr*)&clientAddr, sizeof(struct sockaddr_storage));
 
                     }
@@ -257,9 +260,9 @@ int Server::acceptConnection()
                         unsigned short blockNumHostOrder = ntohs(blockNumNetOrder);
                         if (blockNumHostOrder == fdTransferInfoMap[i].currentBlock)
                         {
-                            cout << "ACK received for block " << fdTransferInfoMap[i].currentBlock << endl;
+                            cout << "ACK received for block " << fdTransferInfoMap[i].currentBlock << " on socket " << i << ". Sending next block" << endl;
                         }
-
+                        fdTransferInfoMap[i].timeLastAckRecvd = time(NULL);
                     }
 
                     fdTransferInfoMap[i].currentBlock += 1;
@@ -268,23 +271,46 @@ int Server::acceptConnection()
                     {
                         FD_CLR(i, &master);
                         fdTransferInfoMap.erase(i);
-                        //close(i);
+                        close(i);
                         break;
                     }
 
                     char fileData[512];
                     int bytesRead = fread(fileData, 1, 512, fdTransferInfoMap[i].filep);
 
-                        //Create TFTP Header
+                    //Create TFTP Header
                     char *dataBuf = createTFTPHeader(DATA, fileData, bytesRead, fdTransferInfoMap[i].currentBlock);
+
+                    fdTransferInfoMap[newConnFd].bytesRead = bytesRead;
+                    fdTransferInfoMap[newConnFd].lastPacketSent = dataBuf;
 
                     // Send the data
                     sendto(i, dataBuf, bytesRead + 4, 0,
                             (struct sockaddr*)&fdTransferInfoMap[i].clientAddr, sizeof(struct sockaddr_storage)); 
 
+                }
+            }
+            else
+            {
+                /*
+                 * Increment Timeout values
+                 */
+                if (fdTransferInfoMap.find(i) != fdTransferInfoMap.end())
+                {
+                    /*
+                     * Socket FD exists in the map
+                     */
+                    time_t timeNow = time(NULL); 
+                    double timeElapsed = difftime(timeNow, fdTransferInfoMap[i].timeLastAckRecvd);
+                    if (timeElapsed > TIMEOUT/1000)
+                    {
+                        /*
+                         * Since ACK has not been received, send the last packet again
+                         */
+                        sendto(i, fdTransferInfoMap[i].lastPacketSent, fdTransferInfoMap[i].bytesRead + 4, 0,
+                                (struct sockaddr*)&fdTransferInfoMap[i].clientAddr, sizeof(struct sockaddr_storage)); 
 
-
-
+                    }
                 }
             }
         }
@@ -302,7 +328,6 @@ int main(int argc, char *argv[])
 
     Server *s = new Server(argv[1], argv[2]);
     s->createSocketAndBind();
-    //s->listenForConnections();
 
     printf("TFTP Server is now online...\n");
     s->acceptConnection();
