@@ -185,7 +185,8 @@ int Server::acceptConnection()
                         /*
                          * Bind the socket to the next available port
                          */
-                        struct sockaddr_in newClient = *((struct sockaddr_in*)&clientAddr);
+                        //struct sockaddr_in newClient = *((struct sockaddr_in*)&clientAddr);
+                        struct sockaddr_in newClient = *((struct sockaddr_in*)&this->hints);
                         newClient.sin_port = htons(nextFreePort);
 
                         if(bind(newConnFd, (sockaddr*)&newClient, sin_size) == - 1)
